@@ -524,12 +524,12 @@ public:
     auto * refresh = new QPushButton("更新");
     auto * clearSel = new QPushButton("すべて選択解除");
     auto * toggleTopics = new QPushButton("Topic一覧を隠す");
-    auto * start = new QPushButton("ECHO開始");
-    auto * stop = new QPushButton("Echo停止");
+    auto * start = new QPushButton("echo開始");
+    auto * stop = new QPushButton("echo停止");
     auto * clearOutput = new QPushButton("表示クリア");
     auto * splitHorizontal = new QPushButton("左右に分割");
     auto * splitVertical = new QPushButton("上下に分割");
-    auto * deletePane = new QPushButton("表示枠を削除");
+    auto * deletePane = new QPushButton("削除");
     search_ = new QLineEdit();
     search_->setPlaceholderText("Topic名または型を検索");
 
@@ -643,8 +643,13 @@ public:
     });
 
     loadTopicSelection();
-    refreshTopics();
     rebuildLayoutWidget();
+
+    // Let ROS 2 discovery populate the graph before the first topic refresh.
+    // Trigger the actual button so startup and manual refresh use the same path.
+    QTimer::singleShot(1000, this, [refresh]() {
+      refresh->click();
+    });
     if (std::getenv("TOPIC_ECHO_GUI_AUTO_JOY") != nullptr) {
       QTimer::singleShot(3000, this, [this]() {
         refreshTopics();
