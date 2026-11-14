@@ -418,7 +418,7 @@ public:
     layoutToolbar->addWidget(splitHorizontal);
     layoutToolbar->addWidget(splitVertical);
     layoutToolbar->addWidget(deletePane);
-    layoutToolbar->addWidget(new QLabel("表示枠を選択し、左のTopic名をクリックして選択・解除します（チェックは表示枠への割当状態）。"));
+    layoutToolbar->addWidget(new QLabel("表示枠内をクリックして選択し、左のTopic名をクリックして割り当て・解除します（チェックは表示枠への割当状態）。"));
     layoutToolbar->addStretch(1);
 
     topics_ = new TopicListWidget();
@@ -548,6 +548,29 @@ public:
   {
     saveTopicSelection();
     node_->stopEcho();
+  }
+
+protected:
+  bool eventFilter(QObject * watched, QEvent * event) override
+  {
+    if (event != nullptr && event->type() == QEvent::MouseButtonPress) {
+      const auto * mouseEvent = static_cast<QMouseEvent *>(event);
+      if (mouseEvent->button() == Qt::LeftButton) {
+        QWidget * widget = qobject_cast<QWidget *>(watched);
+        while (widget != nullptr && widget->objectName() != "topicPane") {
+          widget = widget->parentWidget();
+        }
+        if (widget != nullptr) {
+          for (const auto & [id, pane] : pane_widgets_) {
+            if (pane == widget) {
+              if (id != selected_layout_id_) selectLayoutPane(id);
+              break;
+            }
+          }
+        }
+      }
+    }
+    return QMainWindow::eventFilter(watched, event);
   }
 
 private:
@@ -757,20 +780,6 @@ private:
     }
   }
 
-  void updatePaneTopicLabel(int id)
-  {
-    auto labelIt = pane_topic_labels_.find(id);
-    if (labelIt == pane_topic_labels_.end()) return;
-
-    const LayoutNode * node = findLayoutNode(layout_root_.get(), id);
-    if (node == nullptr || node->is_split || node->topics.empty()) {
-      labelIt->second->setText("トピック未割り当て");
-    } else {
-      labelIt->second->setText(
-        QString("トピック %1 件").arg(node->topics.size()));
-    }
-  }
-
   void assignTopicToSelectedPane(QListWidgetItem * item)
   {
     if (item == nullptr) return;
@@ -857,35 +866,21 @@ private:
 
     auto * layout = new QVBoxLayout(pane);
     layout->setContentsMargins(4, 4, 4, 4);
-    layout->setSpacing(4);
-
-    auto * header = new QHBoxLayout();
-    auto * selectPane = new QPushButton(
-      QString("表示枠 %1").arg(node.id), pane);
-    selectPane->setCheckable(true);
-    pane_select_buttons_[node.id] = selectPane;
-
-    auto * topicLabel = new QLabel(
-      node.topics.empty() ? "トピック未割り当て" :
-      QString("トピック %1 件").arg(node.topics.size()), pane);
-    topicLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    topicLabel->setMinimumWidth(80);
-    pane_topic_labels_[node.id] = topicLabel;
-    header->addWidget(selectPane);
-    header->addWidget(topicLabel, 1);
+    layout->setSpacing(0);
 
     auto * editor = new QPlainTextEdit(pane);
     editor->setReadOnly(true);
     editor->setLineWrapMode(QPlainTextEdit::NoWrap);
     editor->setFont(QFont("monospace", 10));
     output_editors_[node.id] = editor;
-
-    layout->addLayout(header);
     layout->addWidget(editor, 1);
 
-    connect(selectPane, &QPushButton::clicked, this, [this, id = node.id]() {
-      selectLayoutPane(id);
-    });
+    // Select this pane from clicks anywhere in it, including the text viewport
+    // and scrollbars. Do not consume the event so normal editor interaction works.
+    pane->installEventFilter(this);
+    for (QWidget * child : pane->findChildren<QWidget *>()) {
+      child->installEventFilter(this);
+    }
     return pane;
   }
 
@@ -894,8 +889,6 @@ private:
     captureSplitterRatios();
     splitter_widgets_.clear();
     pane_widgets_.clear();
-    pane_select_buttons_.clear();
-    pane_topic_labels_.clear();
     output_editors_.clear();
     pane_topics_.clear();
 
@@ -1032,9 +1025,6 @@ private:
 
   void updatePaneSelectionVisuals()
   {
-    for (const auto & [id, button] : pane_select_buttons_) {
-      button->setChecked(id == selected_layout_id_);
-    }
     for (const auto & [id, pane] : pane_widgets_) {
       pane->setStyleSheet(id == selected_layout_id_ ?
         "QWidget#topicPane { border: 2px solid #3574B8; }" :
@@ -1234,8 +1224,6 @@ private:
   QVBoxLayout * output_layout_{};
   QWidget * layout_widget_{};
   std::map<int, QWidget *> pane_widgets_;
-  std::map<int, QPushButton *> pane_select_buttons_;
-  std::map<int, QLabel *> pane_topic_labels_;
   std::map<int, QPlainTextEdit *> output_editors_;
   std::map<int, std::vector<std::string>> pane_topics_;
   std::map<int, QSplitter *> splitter_widgets_;
