@@ -465,7 +465,7 @@ public:
         selection-color: #ffffff;
         padding: 4px;
       }
-      QLineEdit:focus, QListWidget:focus, QPlainTextEdit:focus {
+      QLineEdit:focus, QPlainTextEdit:focus {
         border-color: #4b91cc;
       }
       QListWidget::item {
