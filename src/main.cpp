@@ -401,7 +401,7 @@ public:
     auto * layoutToolbar = new QHBoxLayout();
 
     auto * refresh = new QPushButton("更新");
-    auto * clearSel = new QPushButton("すべての割当を解除");
+    auto * clearSel = new QPushButton("すべて選択解除");
     auto * toggleTopics = new QPushButton("Topic一覧を隠す");
     auto * start = new QPushButton("ECHO開始");
     auto * stop = new QPushButton("Echo停止");
