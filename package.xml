@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>topic_echo_gui</name>
+  <version>0.2.0</version>
+  <description>C++ Qt GUI for ROS 2 topic echo.</description>
+  <maintainer email="user@example.com">User</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>rosidl_runtime_cpp</depend>
+  <depend>rosidl_typesupport_cpp</depend>
+  <depend>rosidl_typesupport_introspection_cpp</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

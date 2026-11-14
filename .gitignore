@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# C/C++
+*.o
+*.obj
+*.a
+*.so
+*.out
+
+# CMake / colcon
+build/
+install/
+log/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# ROS bag
+*.bag
+*.db3
+*.mcap
+rosbag2_*/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Core dumps
+core
+core.*
