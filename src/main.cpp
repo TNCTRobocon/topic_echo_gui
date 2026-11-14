@@ -547,7 +547,6 @@ public:
     layoutToolbar->addWidget(splitHorizontal);
     layoutToolbar->addWidget(splitVertical);
     layoutToolbar->addWidget(deletePane);
-    layoutToolbar->addWidget(new QLabel("表示枠内をクリックして選択し、左のTopic名をクリックして割り当て・解除します（チェックは表示枠への割当状態）。"));
     layoutToolbar->addStretch(1);
 
     topics_ = new TopicListWidget();
@@ -563,7 +562,7 @@ public:
     topics_panel_ = new QWidget();
     auto * left = new QVBoxLayout(topics_panel_);
     left->setContentsMargins(0, 0, 0, 0);
-    left->addWidget(new QLabel("Topic一覧（名前をクリック：選択・解除／チェック：選択状態）"));
+    left->addWidget(new QLabel("Topic一覧"));
     left->addWidget(topics_);
     auto * right = new QVBoxLayout();
     right->addWidget(new QLabel("Echo出力"));
