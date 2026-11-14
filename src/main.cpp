@@ -156,7 +156,7 @@ class TopicListWidget final : public QListWidget
 {
 public:
   using QListWidget::QListWidget;
-  std::function<void(QListWidgetItem *)> onTopicNameClicked;
+  std::function<void(QListWidgetItem *)> onTopicClicked;
 
 protected:
   bool isCheckIndicatorAt(const QPoint & position) const
@@ -186,20 +186,28 @@ protected:
 
   void mouseReleaseEvent(QMouseEvent * event) override
   {
-    if (swallow_check_click_ ||
-      (event->button() == Qt::LeftButton && isCheckIndicatorAt(event->pos())))
-    {
+    const bool checkPress = swallow_check_click_;
+    const bool checkRelease =
+      event->button() == Qt::LeftButton && isCheckIndicatorAt(event->pos());
+    if (checkPress || checkRelease) {
+      QListWidgetItem * clickedItem =
+        checkPress && checkRelease ? itemAt(event->pos()) : nullptr;
       swallow_check_click_ = false;
       event->accept();
+      // Keep Qt from toggling the check state directly. The shared topic
+      // assignment callback updates the indicator from the actual assignment.
+      if (clickedItem != nullptr && onTopicClicked) {
+        onTopicClicked(clickedItem);
+      }
       return;
     }
 
     QListWidgetItem * clickedItem = itemAt(event->pos());
-    const bool nameClick =
+    const bool itemClick =
       event->button() == Qt::LeftButton && clickedItem != nullptr;
     QListWidget::mouseReleaseEvent(event);
-    if (nameClick && onTopicNameClicked) {
-      onTopicNameClicked(clickedItem);
+    if (itemClick && onTopicClicked) {
+      onTopicClicked(clickedItem);
     }
   }
 
@@ -423,7 +431,7 @@ public:
 
     topics_ = new TopicListWidget();
     topics_->setSelectionMode(QAbstractItemView::NoSelection);
-    topics_->onTopicNameClicked = [this](QListWidgetItem * item) {
+    topics_->onTopicClicked = [this](QListWidgetItem * item) {
       assignTopicToSelectedPane(item);
     };
     output_container_ = new QWidget();
