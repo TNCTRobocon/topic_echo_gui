@@ -14,6 +14,8 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPlainTextEdit>
+#include <QPalette>
+#include <QColor>
 #include <QStyleOptionViewItem>
 #include <QPushButton>
 #include <QSaveFile>
@@ -393,6 +395,125 @@ public:
     setWindowTitle("ROS 2 Topic Echo GUI");
     resize(1100, 700);
     setMinimumSize(850, 520);
+
+    // Apply a consistent dark palette to the complete application window.
+    QPalette darkPalette;
+    darkPalette.setColor(QPalette::Window, QColor("#1b1f24"));
+    darkPalette.setColor(QPalette::WindowText, QColor("#e6e9ed"));
+    darkPalette.setColor(QPalette::Base, QColor("#14191f"));
+    darkPalette.setColor(QPalette::AlternateBase, QColor("#20262e"));
+    darkPalette.setColor(QPalette::ToolTipBase, QColor("#2b3138"));
+    darkPalette.setColor(QPalette::ToolTipText, QColor("#f0f2f5"));
+    darkPalette.setColor(QPalette::Text, QColor("#e6e9ed"));
+    darkPalette.setColor(QPalette::Button, QColor("#2b3138"));
+    darkPalette.setColor(QPalette::ButtonText, QColor("#e6e9ed"));
+    darkPalette.setColor(QPalette::BrightText, QColor("#ff6b6b"));
+    darkPalette.setColor(QPalette::Link, QColor("#76b7ff"));
+    darkPalette.setColor(QPalette::Highlight, QColor("#2f6fad"));
+    darkPalette.setColor(QPalette::HighlightedText, QColor("#ffffff"));
+    darkPalette.setColor(QPalette::PlaceholderText, QColor("#89939e"));
+    darkPalette.setColor(QPalette::Light, QColor("#424b56"));
+    darkPalette.setColor(QPalette::Midlight, QColor("#343c46"));
+    darkPalette.setColor(QPalette::Mid, QColor("#303841"));
+    darkPalette.setColor(QPalette::Dark, QColor("#171b20"));
+    darkPalette.setColor(QPalette::Shadow, QColor("#0b0e12"));
+    darkPalette.setColor(QPalette::Disabled, QPalette::WindowText, QColor("#77818c"));
+    darkPalette.setColor(QPalette::Disabled, QPalette::Text, QColor("#77818c"));
+    darkPalette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor("#77818c"));
+    QApplication::setPalette(darkPalette);
+    setPalette(darkPalette);
+    setStyleSheet(R"(
+      QMainWindow, QWidget {
+        background-color: #1b1f24;
+        color: #e6e9ed;
+      }
+      QLabel {
+        background-color: transparent;
+        color: #e6e9ed;
+      }
+      QPushButton {
+        background-color: #2b3138;
+        color: #e6e9ed;
+        border: 1px solid #596574;
+        border-radius: 6px;
+        padding: 6px 11px;
+      }
+      QPushButton:hover {
+        background-color: #39434f;
+        border-color: #4b91cc;
+      }
+      QPushButton:pressed {
+        background-color: #234d70;
+        border-color: #2f6fad;
+      }
+      QPushButton:checked {
+        background-color: #2f6fad;
+        color: #ffffff;
+        border-color: #4b91cc;
+      }
+      QPushButton:disabled {
+        background-color: #252a30;
+        color: #77818c;
+        border-color: #3a424c;
+      }
+      QLineEdit, QListWidget, QPlainTextEdit {
+        background-color: #14191f;
+        color: #e6e9ed;
+        border: 1px solid #46515e;
+        border-radius: 4px;
+        selection-background-color: #2f6fad;
+        selection-color: #ffffff;
+        padding: 4px;
+      }
+      QLineEdit:focus, QListWidget:focus, QPlainTextEdit:focus {
+        border-color: #4b91cc;
+      }
+      QListWidget::item {
+        padding: 5px 4px;
+        border-bottom: 1px solid #29313a;
+      }
+      QListWidget::item:hover {
+        background-color: #28313b;
+      }
+      QScrollBar:vertical {
+        background-color: #171c22;
+        width: 12px;
+        margin: 0;
+      }
+      QScrollBar:horizontal {
+        background-color: #171c22;
+        height: 12px;
+        margin: 0;
+      }
+      QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+        background-color: #485462;
+        border-radius: 5px;
+        min-width: 24px;
+        min-height: 24px;
+      }
+      QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+        background-color: #627386;
+      }
+      QScrollBar::add-line, QScrollBar::sub-line {
+        background: none;
+        border: none;
+      }
+      QScrollBar::add-page, QScrollBar::sub-page {
+        background: none;
+      }
+      QSplitter::handle {
+        background-color: #3a424c;
+      }
+      QSplitter::handle:hover {
+        background-color: #4b91cc;
+      }
+      QToolTip {
+        background-color: #2b3138;
+        color: #f0f2f5;
+        border: 1px solid #596574;
+        padding: 4px;
+      }
+    )");
 
     auto * central = new QWidget(this);
     auto * root = new QVBoxLayout(central);
