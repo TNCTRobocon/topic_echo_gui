@@ -14,8 +14,16 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPlainTextEdit>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPaintEvent>
+#include <QScrollBar>
+#include <QSignalBlocker>
+#include <QStackedWidget>
 #include <QPalette>
 #include <QColor>
+#include <QComboBox>
+#include <QDateTime>
 #include <QStyleOptionViewItem>
 #include <QPushButton>
 #include <QSaveFile>
@@ -25,6 +33,9 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <deque>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -70,6 +81,33 @@ using rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT64;
 
 namespace
 {
+using NumericFields = std::map<std::string, double>;
+
+struct TopicUpdate
+{
+  std::string topic;
+  std::string text;
+  NumericFields numeric_fields;
+  int64_t monotonic_timestamp_ns{0};
+  int64_t wall_timestamp_ms{0};
+};
+
+constexpr size_t kTopicHistoryLimit = 2000;
+constexpr size_t kPendingUpdateLimit = 2000;
+constexpr size_t kMaxNumericFields = 128;
+constexpr size_t kPendingUpdateByteLimit = 4U * 1024U * 1024U;
+constexpr size_t kTopicHistoryByteLimit = 16U * 1024U * 1024U;
+
+size_t estimateTopicUpdateBytes(const TopicUpdate & update)
+{
+  size_t bytes = sizeof(TopicUpdate) + update.text.size();
+  for (const auto & [field, value] : update.numeric_fields) {
+    Q_UNUSED(value);
+    bytes += sizeof(std::pair<const std::string, double>) + 32U + field.size();
+  }
+  return bytes;
+}
+
 std::string spaces(int depth)
 {
   return std::string(static_cast<size_t>(depth) * 2U, ' ');
@@ -136,6 +174,90 @@ std::string renderMessage(const MessageMembers * members, const void * message, 
     out << renderField(member, field, depth);
   }
   return out.str();
+}
+
+bool numericFieldToDouble(uint8_t type, const void * value, double & result)
+{
+  switch (type) {
+    case ROS_TYPE_CHAR:
+    case ROS_TYPE_OCTET:
+    case ROS_TYPE_UINT8:
+      result = static_cast<double>(*static_cast<const uint8_t *>(value)); return true;
+    case ROS_TYPE_INT8:
+      result = static_cast<double>(*static_cast<const int8_t *>(value)); return true;
+    case ROS_TYPE_UINT16:
+      result = static_cast<double>(*static_cast<const uint16_t *>(value)); return true;
+    case ROS_TYPE_INT16:
+      result = static_cast<double>(*static_cast<const int16_t *>(value)); return true;
+    case ROS_TYPE_UINT32:
+      result = static_cast<double>(*static_cast<const uint32_t *>(value)); return true;
+    case ROS_TYPE_INT32:
+      result = static_cast<double>(*static_cast<const int32_t *>(value)); return true;
+    case ROS_TYPE_UINT64:
+      result = static_cast<double>(*static_cast<const uint64_t *>(value)); return true;
+    case ROS_TYPE_INT64:
+      result = static_cast<double>(*static_cast<const int64_t *>(value)); return true;
+    case ROS_TYPE_FLOAT:
+      result = static_cast<double>(*static_cast<const float *>(value)); return std::isfinite(result);
+    case ROS_TYPE_DOUBLE:
+      result = *static_cast<const double *>(value); return std::isfinite(result);
+    default:
+      return false;
+  }
+}
+
+void collectNumericFields(
+  const MessageMembers * members, const void * message, const std::string & prefix,
+  NumericFields & result, size_t max_fields = kMaxNumericFields)
+{
+  for (uint32_t i = 0; i < members->member_count_ && result.size() < max_fields; ++i) {
+    const auto & member = members->members_[i];
+    const void * field =
+      reinterpret_cast<const unsigned char *>(message) + member.offset_;
+    const std::string name = prefix.empty() ? member.name_ : prefix + "." + member.name_;
+
+    if (member.is_array_) {
+      const size_t count = member.size_function(field);
+      for (size_t index = 0; index < count && result.size() < max_fields; ++index) {
+        const void * item = member.get_const_function(field, index);
+        const std::string item_name = name + "[" + std::to_string(index) + "]";
+        if (member.type_id_ == ROS_TYPE_MESSAGE) {
+          collectNumericFields(
+            static_cast<const MessageMembers *>(member.members_->data), item, item_name,
+            result, max_fields);
+        } else {
+          double value = 0.0;
+          if (numericFieldToDouble(member.type_id_, item, value)) {
+            result[item_name] = value;
+          }
+        }
+      }
+    } else if (member.type_id_ == ROS_TYPE_MESSAGE) {
+      collectNumericFields(
+        static_cast<const MessageMembers *>(member.members_->data), field, name,
+        result, max_fields);
+    } else {
+      double value = 0.0;
+      if (numericFieldToDouble(member.type_id_, field, value)) {
+        result[name] = value;
+      }
+    }
+  }
+}
+
+NumericFields collectJoyNumericFields(const sensor_msgs::msg::Joy & msg)
+{
+  NumericFields result;
+  for (size_t i = 0; i < msg.axes.size(); ++i) {
+    if (std::isfinite(msg.axes[i])) {
+      result["axes[" + std::to_string(i) + "]"] = msg.axes[i];
+    }
+  }
+  for (size_t i = 0; i < msg.buttons.size(); ++i) {
+    result["buttons[" + std::to_string(i) + "]"] =
+      static_cast<double>(msg.buttons[i]);
+  }
+  return result;
 }
 
 std::string formatJoy(const sensor_msgs::msg::Joy & msg)
@@ -267,7 +389,7 @@ public:
         auto sub = create_subscription<sensor_msgs::msg::Joy>(
           name, qos_,
           [this, name](sensor_msgs::msg::Joy::ConstSharedPtr msg) {
-            updateLatest(name, formatJoy(*msg));
+            enqueueUpdate(name, formatJoy(*msg), collectJoyNumericFields(*msg));
           });
         subscriptions_[name] = sub;
       } else {
@@ -287,8 +409,9 @@ public:
   void removeSubscription(const std::string & name)
   {
     subscriptions_.erase(name);
-    std::lock_guard<std::mutex> lock(latest_mutex_);
-    latest_.erase(name);
+    std::lock_guard<std::mutex> lock(updates_mutex_);
+    pending_updates_.erase(name);
+    pending_update_bytes_.erase(name);
   }
 
   bool hasSubscription(const std::string & name) const
@@ -309,24 +432,60 @@ public:
   void stopEcho()
   {
     subscriptions_.clear();
-    std::lock_guard<std::mutex> lock(latest_mutex_);
-    latest_.clear();
+    std::lock_guard<std::mutex> lock(updates_mutex_);
+    pending_updates_.clear();
+    pending_update_bytes_.clear();
   }
-  using Snapshot = std::map<std::string, std::pair<uint64_t, std::string>>;
 
-  Snapshot snapshot() const
+  std::vector<TopicUpdate> takePendingUpdates()
   {
-    std::lock_guard<std::mutex> lock(latest_mutex_);
-    return latest_;
+    std::vector<TopicUpdate> updates;
+    std::lock_guard<std::mutex> lock(updates_mutex_);
+    for (auto & [topic, queue] : pending_updates_) {
+      Q_UNUSED(topic);
+      for (auto & update : queue) updates.push_back(std::move(update));
+    }
+    pending_updates_.clear();
+    pending_update_bytes_.clear();
+    return updates;
+  }
+
+  void clearPendingUpdates()
+  {
+    std::lock_guard<std::mutex> lock(updates_mutex_);
+    pending_updates_.clear();
+    pending_update_bytes_.clear();
   }
 
 private:
-  void updateLatest(const std::string & topic, const std::string & text)
+  void enqueueUpdate(
+    const std::string & topic, const std::string & text,
+    NumericFields numeric_fields)
   {
-    std::lock_guard<std::mutex> lock(latest_mutex_);
-    auto & slot = latest_[topic];
-    ++slot.first;
-    slot.second = text;
+    const auto monotonic_now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto wall_now = std::chrono::system_clock::now().time_since_epoch();
+    TopicUpdate update;
+    update.topic = topic;
+    update.text = text;
+    update.numeric_fields = std::move(numeric_fields);
+    update.monotonic_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      monotonic_now).count();
+    update.wall_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      wall_now).count();
+
+    const size_t update_bytes = estimateTopicUpdateBytes(update);
+    std::lock_guard<std::mutex> lock(updates_mutex_);
+    auto & pending = pending_updates_[topic];
+    auto & pending_bytes = pending_update_bytes_[topic];
+    pending.push_back(std::move(update));
+    pending_bytes += update_bytes;
+    while (pending.size() > 1 &&
+      (pending.size() > kPendingUpdateLimit ||
+      pending_bytes > kPendingUpdateByteLimit))
+    {
+      pending_bytes -= estimateTopicUpdateBytes(pending.front());
+      pending.pop_front();
+    }
   }
 
   void renderGeneric(
@@ -354,7 +513,9 @@ private:
       try {
         rclcpp::SerializationBase serializer(cpp_ts);
         serializer.deserialize_message(serialized.get(), memory);
-        updateLatest(topic, renderMessage(members, memory, 0));
+        NumericFields numeric_fields;
+        collectNumericFields(members, memory, "", numeric_fields);
+        enqueueUpdate(topic, renderMessage(members, memory, 0), std::move(numeric_fields));
       } catch (...) {
         members->fini_function(memory);
         std::free(memory);
@@ -363,17 +524,196 @@ private:
       members->fini_function(memory);
       std::free(memory);
     } catch (const std::exception & e) {
-      updateLatest(topic, std::string("表示変換エラー: ") + e.what());
+      enqueueUpdate(topic, std::string("表示変換エラー: ") + e.what(), {});
     }
   }
 
   rclcpp::QoS qos_;
   std::map<std::string, rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
-  mutable std::mutex latest_mutex_;
-  Snapshot latest_;
+  mutable std::mutex updates_mutex_;
+  std::map<std::string, std::deque<TopicUpdate>> pending_updates_;
+  std::map<std::string, size_t> pending_update_bytes_;
 };
+
+class NumericGraphWidget final : public QWidget
+{
+  struct Point
+  {
+    int64_t monotonic_ns{0};
+    int64_t wall_time_ms{0};
+    double value{0.0};
+  };
+
+public:
+  explicit NumericGraphWidget(QWidget * parent = nullptr)
+  : QWidget(parent)
+  {
+    setMinimumSize(80, 60);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  }
+
+  void setSelectedField(const std::string & field)
+  {
+    if (selected_field_ == field) return;
+    selected_field_ = field;
+    update();
+  }
+
+  void addSample(const TopicUpdate & sample)
+  {
+    for (const auto & [field, value] : sample.numeric_fields) {
+      auto & points = series_[field];
+      points.push_back(Point{
+        sample.monotonic_timestamp_ns, sample.wall_timestamp_ms, value});
+      while (points.size() > kTopicHistoryLimit) points.pop_front();
+    }
+    has_message_ = true;
+    status_message_.clear();
+    update();
+  }
+
+  void setStatusMessage(const QString & message)
+  {
+    if (status_message_ == message) return;
+    status_message_ = message;
+    update();
+  }
+
+  void clearHistory()
+  {
+    series_.clear();
+    has_message_ = false;
+    update();
+  }
+
+protected:
+  void paintEvent(QPaintEvent * event) override
+  {
+    Q_UNUSED(event);
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.fillRect(rect(), QColor("#14191f"));
+
+    const auto series_it = series_.find(selected_field_);
+    if (!status_message_.isEmpty()) {
+      drawCenteredMessage(painter, status_message_);
+      return;
+    }
+    if (selected_field_.empty() || series_.empty()) {
+      drawCenteredMessage(
+        painter, has_message_ ? "グラフ化できる数値フィールドがありません" :
+        "数値データ受信待ち...");
+      return;
+    }
+    if (series_it == series_.end() || series_it->second.empty()) {
+      drawCenteredMessage(painter, "選択されたフィールドの数値データがありません");
+      return;
+    }
+
+    const auto & points = series_it->second;
+    const int left = 64;
+    const int right = 14;
+    const int top = 14;
+    const int bottom = 34;
+    const QRectF plot(
+      left, top, std::max(1, width() - left - right),
+      std::max(1, height() - top - bottom));
+
+    double min_value = points.front().value;
+    double max_value = points.front().value;
+    for (const auto & point : points) {
+      min_value = std::min(min_value, point.value);
+      max_value = std::max(max_value, point.value);
+    }
+    double range = max_value - min_value;
+    const double padding = range > 0.0 ? range * 0.08 :
+      std::max(1.0, std::abs(max_value) * 0.08);
+    min_value -= padding;
+    max_value += padding;
+    range = max_value - min_value;
+
+    painter.setFont(QFont("sans-serif", 8));
+    QPen grid_pen(QColor("#303841"));
+    grid_pen.setWidth(1);
+    painter.setPen(grid_pen);
+    for (int tick = 0; tick <= 4; ++tick) {
+      const qreal y = plot.top() + plot.height() * tick / 4.0;
+      painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+      const double value = max_value - range * tick / 4.0;
+      painter.setPen(QColor("#aeb8c4"));
+      painter.drawText(
+        QRectF(2, y - 9, left - 10, 18), Qt::AlignRight | Qt::AlignVCenter,
+        QString::number(value, 'g', 4));
+      painter.setPen(grid_pen);
+    }
+    painter.drawRect(plot);
+
+    const int64_t first_ns = points.front().monotonic_ns;
+    const int64_t last_ns = points.back().monotonic_ns;
+    const int64_t time_span = std::max<int64_t>(1, last_ns - first_ns);
+    QPainterPath path;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const auto & point = points[i];
+      const qreal x = plot.left() + plot.width() *
+        static_cast<qreal>(point.monotonic_ns - first_ns) / time_span;
+      const qreal y = plot.bottom() - plot.height() *
+        static_cast<qreal>(point.value - min_value) / range;
+      if (i == 0) path.moveTo(x, y);
+      else path.lineTo(x, y);
+    }
+    QPen line_pen(QColor("#58a6ff"));
+    line_pen.setWidth(2);
+    painter.setPen(line_pen);
+    painter.drawPath(path);
+    if (points.size() == 1) {
+      const auto & point = points.front();
+      const qreal x = plot.left();
+      const qreal y = plot.bottom() - plot.height() *
+        static_cast<qreal>(point.value - min_value) / range;
+      painter.setBrush(QColor("#58a6ff"));
+      painter.drawEllipse(QPointF(x, y), 3.5, 3.5);
+    }
+
+    painter.setPen(QColor("#aeb8c4"));
+    const QString first_time = QDateTime::fromMSecsSinceEpoch(
+      points.front().wall_time_ms).toString("HH:mm:ss");
+    const QString last_time = QDateTime::fromMSecsSinceEpoch(
+      points.back().wall_time_ms).toString("HH:mm:ss");
+    painter.drawText(
+      QRectF(plot.left(), plot.bottom() + 5, plot.width() / 2.0, 20),
+      Qt::AlignLeft | Qt::AlignTop, first_time);
+    painter.drawText(
+      QRectF(plot.left() + plot.width() / 2.0, plot.bottom() + 5,
+        plot.width() / 2.0, 20), Qt::AlignRight | Qt::AlignTop, last_time);
+  }
+
+private:
+  void drawCenteredMessage(QPainter & painter, const QString & message)
+  {
+    painter.setPen(QColor("#89939e"));
+    painter.drawText(rect().adjusted(8, 8, -8, -8), Qt::AlignCenter, message);
+  }
+
+  std::string selected_field_;
+  std::map<std::string, std::deque<Point>> series_;
+  QString status_message_;
+  bool has_message_{false};
+};
+
 class MainWindow final : public QMainWindow
 {
+  struct TopicDisplayWidgets
+  {
+    QWidget * card{nullptr};
+    QComboBox * field_selector{nullptr};
+    QStackedWidget * stack{nullptr};
+    QPlainTextEdit * text_view{nullptr};
+    NumericGraphWidget * graph_view{nullptr};
+    std::vector<std::string> available_fields;
+    bool has_received{false};
+    QString placeholder;
+  };
+
   struct LayoutNode
   {
     int id{0};
@@ -465,8 +805,31 @@ public:
         selection-color: #ffffff;
         padding: 4px;
       }
-      QLineEdit:focus, QPlainTextEdit:focus {
+      QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
         border-color: #4b91cc;
+      }
+      QComboBox {
+        background-color: #14191f;
+        color: #e6e9ed;
+        border: 1px solid #46515e;
+        border-radius: 4px;
+        padding: 3px 6px;
+      }
+      QComboBox::drop-down {
+        border: none;
+        width: 22px;
+      }
+      QComboBox QAbstractItemView {
+        background-color: #20262e;
+        color: #e6e9ed;
+        selection-background-color: #2f6fad;
+        selection-color: #ffffff;
+        border: 1px solid #46515e;
+      }
+      QWidget#topicDisplayCard {
+        background-color: #1b1f24;
+        border: 1px solid #46515e;
+        border-radius: 5px;
       }
       QListWidget::item {
         padding: 5px 4px;
@@ -527,6 +890,7 @@ public:
     auto * start = new QPushButton("echo開始");
     auto * stop = new QPushButton("echo停止");
     auto * clearOutput = new QPushButton("表示クリア");
+    display_mode_button_ = new QPushButton("表示方式：テキスト");
     auto * splitHorizontal = new QPushButton("左右に分割");
     auto * splitVertical = new QPushButton("上下に分割");
     auto * deletePane = new QPushButton("削除");
@@ -539,6 +903,7 @@ public:
     toolbar->addWidget(start);
     toolbar->addWidget(stop);
     toolbar->addWidget(clearOutput);
+    toolbar->addWidget(display_mode_button_);
     toolbar->addSpacing(12);
     toolbar->addWidget(new QLabel("検索:"));
     toolbar->addWidget(search_, 1);
@@ -600,6 +965,9 @@ public:
       toggleTopics->setText(hidden ? "Topic一覧を表示" : "Topic一覧を隠す");
     });
     connect(start, &QPushButton::clicked, this, [this]() { startEcho(); });
+    connect(display_mode_button_, &QPushButton::clicked, this, [this]() {
+      setGraphMode(!graph_mode_);
+    });
     connect(splitHorizontal, &QPushButton::clicked, this, [this]() {
       splitSelectedPane(Qt::Horizontal);
     });
@@ -612,19 +980,24 @@ public:
     connect(stop, &QPushButton::clicked, this, [this]() {
       node_->stopEcho();
       echo_active_ = false;
-      for (auto & [id, editor] : output_editors_) {
-        Q_UNUSED(id);
-        editor->clear();
-      }
       syncTopicCheckStates();
       refreshOutput();
-      status_->setText("Echo停止中");
+      status_->setText("Echo停止中（受信履歴は保持）");
     });
     connect(clearOutput, &QPushButton::clicked, this, [this]() {
-      for (auto & [topic, editor] : output_editors_) {
-        Q_UNUSED(topic);
-        editor->clear();
+      node_->clearPendingUpdates();
+      for (auto & [topic, history] : topic_histories_) {
+        history.clear();
+        topic_history_bytes_[topic] = 0;
       }
+      for (auto & [topic, view] : topic_display_widgets_) {
+        view.text_view->clear();
+        view.graph_view->clearHistory();
+        view.has_received = false;
+        view.placeholder.clear();
+        topic_scroll_states_[topic] = {0, true};
+      }
+      refreshOutput();
     });
     connect(search_, &QLineEdit::textChanged, this, [this](const QString &) {
       applyFilter();
@@ -895,10 +1268,6 @@ private:
 
     const auto errors = node_->startEcho(selections);
     echo_active_ = errors.size() < selections.size();
-    for (auto & [id, editor] : output_editors_) {
-      Q_UNUSED(id);
-      editor->clear();
-    }
     syncTopicCheckStates();
     refreshOutput();
 
@@ -967,6 +1336,191 @@ private:
     }
   }
 
+  void updateTopicFieldSelector(
+    const std::string & topic, TopicDisplayWidgets & view,
+    const NumericFields & fields)
+  {
+    if (fields.empty()) return;
+
+    std::vector<std::string> field_names;
+    field_names.reserve(fields.size());
+    for (const auto & [field, value] : fields) {
+      Q_UNUSED(value);
+      field_names.push_back(field);
+    }
+    if (field_names == view.available_fields) return;
+    view.available_fields = std::move(field_names);
+
+    std::string selected = selected_graph_fields_[topic];
+    const auto selected_it = fields.find(selected);
+    if (selected_it == fields.end()) selected = fields.begin()->first;
+
+    QSignalBlocker blocker(view.field_selector);
+    view.field_selector->clear();
+    if (fields.size() > 1) {
+      for (const auto & [field, value] : fields) {
+        Q_UNUSED(value);
+        view.field_selector->addItem(QString::fromStdString(field),
+          QString::fromStdString(field));
+      }
+      const int index = view.field_selector->findData(QString::fromStdString(selected));
+      view.field_selector->setCurrentIndex(index >= 0 ? index : 0);
+      view.field_selector->setVisible(graph_mode_);
+    } else {
+      view.field_selector->setVisible(false);
+      selected = fields.begin()->first;
+    }
+
+    selected_graph_fields_[topic] = selected;
+    view.graph_view->setSelectedField(selected);
+  }
+
+  void appendTopicUpdateToView(
+    const std::string & topic, TopicDisplayWidgets & view,
+    const TopicUpdate & update)
+  {
+    if (!update.numeric_fields.empty()) {
+      updateTopicFieldSelector(topic, view, update.numeric_fields);
+    }
+    view.graph_view->addSample(update);
+    view.has_received = true;
+    view.placeholder.clear();
+    view.text_view->setPlaceholderText(QString());
+
+    const QString timestamp = QDateTime::fromMSecsSinceEpoch(
+      update.wall_timestamp_ms).toString("HH:mm:ss.zzz");
+    const QString entry = QString("[%1]\n%2")
+      .arg(timestamp, QString::fromStdString(update.text));
+    QScrollBar * scroll_bar = view.text_view->verticalScrollBar();
+    const int old_value = scroll_bar->value();
+    const bool follow_tail = old_value >= scroll_bar->maximum() - 1;
+    view.text_view->appendPlainText(entry);
+    if (follow_tail) {
+      scroll_bar->setValue(scroll_bar->maximum());
+    } else {
+      scroll_bar->setValue(std::min(old_value, scroll_bar->maximum()));
+    }
+    topic_scroll_states_[topic] = {scroll_bar->value(), follow_tail};
+  }
+
+  QWidget * createTopicDisplayWidget(const std::string & topic, QWidget * parent)
+  {
+    auto * card = new QWidget(parent);
+    card->setObjectName("topicDisplayCard");
+    card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+    auto * card_layout = new QVBoxLayout(card);
+    card_layout->setContentsMargins(5, 4, 5, 5);
+    card_layout->setSpacing(3);
+
+    auto * header = new QWidget(card);
+    header->setFixedHeight(28);
+    auto * header_layout = new QHBoxLayout(header);
+    header_layout->setContentsMargins(2, 0, 2, 0);
+    header_layout->setSpacing(6);
+
+    auto * topic_label = new QLabel(QString::fromStdString(topic), header);
+    topic_label->setToolTip(QString::fromStdString(topic));
+    topic_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    header_layout->addWidget(topic_label, 1);
+
+    auto * field_selector = new QComboBox(header);
+    field_selector->setMinimumWidth(100);
+    field_selector->setMaximumWidth(260);
+    field_selector->setFixedHeight(24);
+    field_selector->setToolTip("グラフに表示する数値フィールド");
+    field_selector->hide();
+    header_layout->addWidget(field_selector);
+
+    auto * stack = new QStackedWidget(card);
+    auto * text_view = new QPlainTextEdit(stack);
+    text_view->setReadOnly(true);
+    text_view->setUndoRedoEnabled(false);
+    text_view->setLineWrapMode(QPlainTextEdit::NoWrap);
+    text_view->setFont(QFont("monospace", 9));
+    text_view->setMaximumBlockCount(50000);
+    text_view->setPlaceholderText(node_->hasSubscription(topic) ?
+      "受信待ち..." : "未購読（echo開始で受信します）");
+
+    auto * graph_view = new NumericGraphWidget(stack);
+    graph_view->setStatusMessage(node_->hasSubscription(topic) ?
+      "数値データ受信待ち..." : "未購読（echo開始で受信します）");
+    stack->addWidget(text_view);
+    stack->addWidget(graph_view);
+    stack->setCurrentWidget(graph_mode_ ?
+      static_cast<QWidget *>(graph_view) : static_cast<QWidget *>(text_view));
+
+    card_layout->addWidget(header);
+    card_layout->addWidget(stack, 1);
+
+    TopicDisplayWidgets view;
+    view.card = card;
+    view.field_selector = field_selector;
+    view.stack = stack;
+    view.text_view = text_view;
+    view.graph_view = graph_view;
+    topic_display_widgets_[topic] = view;
+
+    connect(field_selector, QOverload<int>::of(&QComboBox::currentIndexChanged),
+      this, [this, topic, field_selector](int index) {
+        const QString field = field_selector->itemData(index).toString();
+        if (field.isEmpty()) return;
+        selected_graph_fields_[topic] = field.toStdString();
+        const auto view_it = topic_display_widgets_.find(topic);
+        if (view_it != topic_display_widgets_.end()) {
+          view_it->second.graph_view->setSelectedField(field.toStdString());
+        }
+      });
+
+    const auto history_it = topic_histories_.find(topic);
+    if (history_it != topic_histories_.end()) {
+      QStringList entries;
+      for (const auto & update : history_it->second) {
+        if (!update.numeric_fields.empty()) {
+          updateTopicFieldSelector(topic, topic_display_widgets_.at(topic),
+            update.numeric_fields);
+        }
+        graph_view->addSample(update);
+        const QString timestamp = QDateTime::fromMSecsSinceEpoch(
+          update.wall_timestamp_ms).toString("HH:mm:ss.zzz");
+        entries.append(QString("[%1]\n%2")
+          .arg(timestamp, QString::fromStdString(update.text)));
+      }
+      if (!entries.isEmpty()) {
+        text_view->setPlainText(entries.join("\n"));
+        QScrollBar * scroll_bar = text_view->verticalScrollBar();
+        const auto scroll_it = topic_scroll_states_.find(topic);
+        if (scroll_it != topic_scroll_states_.end() && !scroll_it->second.second) {
+          scroll_bar->setValue(std::min(scroll_it->second.first, scroll_bar->maximum()));
+        } else {
+          scroll_bar->setValue(scroll_bar->maximum());
+        }
+        topic_scroll_states_[topic] = {
+          scroll_bar->value(), scroll_bar->value() >= scroll_bar->maximum() - 1};
+        topic_display_widgets_[topic].has_received = true;
+        text_view->setPlaceholderText(QString());
+      }
+    }
+    return card;
+  }
+
+  void setGraphMode(bool enabled)
+  {
+    graph_mode_ = enabled;
+    if (display_mode_button_ != nullptr) {
+      display_mode_button_->setText(
+        enabled ? "表示方式：グラフ" : "表示方式：テキスト");
+    }
+    for (auto & [topic, view] : topic_display_widgets_) {
+      Q_UNUSED(topic);
+      view.stack->setCurrentWidget(enabled ?
+        static_cast<QWidget *>(view.graph_view) :
+        static_cast<QWidget *>(view.text_view));
+      view.field_selector->setVisible(
+        enabled && view.available_fields.size() > 1);
+    }
+  }
+
   QWidget * createLayoutWidget(LayoutNode & node)
   {
     if (node.is_split && node.first && node.second) {
@@ -995,21 +1549,32 @@ private:
     pane->setObjectName("topicPane");
     pane->setMinimumSize(100, 80);
     pane_widgets_[node.id] = pane;
-    pane_topics_[node.id] = node.topics;
 
-    auto * layout = new QVBoxLayout(pane);
-    layout->setContentsMargins(4, 4, 4, 4);
-    layout->setSpacing(0);
+    auto * grid = new QGridLayout(pane);
+    grid->setContentsMargins(4, 4, 4, 4);
+    grid->setHorizontalSpacing(6);
+    grid->setVerticalSpacing(6);
 
-    auto * editor = new QPlainTextEdit(pane);
-    editor->setReadOnly(true);
-    editor->setLineWrapMode(QPlainTextEdit::NoWrap);
-    editor->setFont(QFont("monospace", 10));
-    output_editors_[node.id] = editor;
-    layout->addWidget(editor, 1);
+    if (node.topics.empty()) {
+      auto * empty_label = new QLabel("Topic未割り当て", pane);
+      empty_label->setAlignment(Qt::AlignCenter);
+      grid->addWidget(empty_label, 0, 0);
+    } else {
+      const int columns = std::max(1, static_cast<int>(
+        std::ceil(std::sqrt(static_cast<double>(node.topics.size())))));
+      for (size_t index = 0; index < node.topics.size(); ++index) {
+        const std::string & topic = node.topics[index];
+        auto * topic_card = createTopicDisplayWidget(topic, pane);
+        const int row = static_cast<int>(index) / columns;
+        const int column = static_cast<int>(index) % columns;
+        grid->addWidget(topic_card, row, column);
+        grid->setColumnStretch(column, 1);
+        grid->setRowStretch(row, 1);
+      }
+    }
 
-    // Select this pane from clicks anywhere in it, including the text viewport
-    // and scrollbars. Do not consume the event so normal editor interaction works.
+    // Select this pane from clicks anywhere in it, including each Topic view.
+    // Do not consume events so text scrolling, selection, and field selection work.
     pane->installEventFilter(this);
     for (QWidget * child : pane->findChildren<QWidget *>()) {
       child->installEventFilter(this);
@@ -1020,10 +1585,14 @@ private:
   void rebuildLayoutWidget()
   {
     captureSplitterRatios();
+    for (const auto & [topic, view] : topic_display_widgets_) {
+      QScrollBar * scroll_bar = view.text_view->verticalScrollBar();
+      topic_scroll_states_[topic] = {
+        scroll_bar->value(), scroll_bar->value() >= scroll_bar->maximum() - 1};
+    }
     splitter_widgets_.clear();
     pane_widgets_.clear();
-    output_editors_.clear();
-    pane_topics_.clear();
+    topic_display_widgets_.clear();
 
     if (layout_widget_ != nullptr) {
       output_layout_->removeWidget(layout_widget_);
@@ -1042,6 +1611,29 @@ private:
 
     layout_widget_ = createLayoutWidget(*layout_root_);
     output_layout_->addWidget(layout_widget_, 1);
+
+    std::set<std::string> active_topics;
+    for (const auto & [topic, view] : topic_display_widgets_) {
+      Q_UNUSED(view);
+      active_topics.insert(topic);
+    }
+    for (auto it = topic_histories_.begin(); it != topic_histories_.end();) {
+      if (active_topics.count(it->first) == 0) it = topic_histories_.erase(it);
+      else ++it;
+    }
+    for (auto it = topic_history_bytes_.begin(); it != topic_history_bytes_.end();) {
+      if (active_topics.count(it->first) == 0) it = topic_history_bytes_.erase(it);
+      else ++it;
+    }
+    for (auto it = selected_graph_fields_.begin(); it != selected_graph_fields_.end();) {
+      if (active_topics.count(it->first) == 0) it = selected_graph_fields_.erase(it);
+      else ++it;
+    }
+    for (auto it = topic_scroll_states_.begin(); it != topic_scroll_states_.end();) {
+      if (active_topics.count(it->first) == 0) it = topic_scroll_states_.erase(it);
+      else ++it;
+    }
+
     updatePaneSelectionVisuals();
     refreshOutput();
   }
@@ -1186,31 +1778,39 @@ private:
 
   void refreshOutput()
   {
-    const auto snapshot = node_->snapshot();
-    for (const auto & [paneId, editor] : output_editors_) {
-      const auto assignedIt = pane_topics_.find(paneId);
-      QString rendered;
-      if (assignedIt != pane_topics_.end()) {
-        for (const auto & topic : assignedIt->second) {
-          if (!rendered.isEmpty()) rendered += "\n";
-          rendered += QString::fromStdString(topic) + "\n";
-          rendered += QString(48, '-') + "\n";
-
-          const auto valueIt = snapshot.find(topic);
-          if (!node_->hasSubscription(topic)) {
-            rendered += "未購読（Echo開始で受信します）\n";
-          } else if (valueIt == snapshot.end()) {
-            rendered += "受信待ち...\n";
-          } else {
-            rendered += QString::fromStdString(valueIt->second.second);
-            if (!rendered.endsWith('\n')) rendered += "\n";
-          }
-          rendered += "\n";
-        }
+    // Drain all received samples in batches on the GUI thread. ROS callbacks
+    // only enqueue data; they never access Qt widgets.
+    const auto updates = node_->takePendingUpdates();
+    for (const auto & update : updates) {
+      auto & history = topic_histories_[update.topic];
+      auto & history_bytes = topic_history_bytes_[update.topic];
+      history.push_back(update);
+      history_bytes += estimateTopicUpdateBytes(update);
+      while (history.size() > 1 &&
+        (history.size() > kTopicHistoryLimit ||
+        history_bytes > kTopicHistoryByteLimit))
+      {
+        history_bytes -= estimateTopicUpdateBytes(history.front());
+        history.pop_front();
       }
 
-      if (editor->toPlainText() != rendered) {
-        editor->setPlainText(rendered);
+      const auto view_it = topic_display_widgets_.find(update.topic);
+      if (view_it != topic_display_widgets_.end()) {
+        appendTopicUpdateToView(update.topic, view_it->second, update);
+      }
+    }
+
+    for (auto & [topic, view] : topic_display_widgets_) {
+      if (view.has_received) continue;
+      const bool subscribed = node_->hasSubscription(topic);
+      const QString text_placeholder = subscribed ?
+        "受信待ち..." : "未購読（echo開始で受信します）";
+      const QString graph_placeholder = subscribed ?
+        "数値データ受信待ち..." : "未購読（echo開始で受信します）";
+      if (view.placeholder != text_placeholder) {
+        view.placeholder = text_placeholder;
+        view.text_view->setPlaceholderText(text_placeholder);
+        view.graph_view->setStatusMessage(graph_placeholder);
       }
     }
   }
@@ -1357,10 +1957,15 @@ private:
   QVBoxLayout * output_layout_{};
   QWidget * layout_widget_{};
   std::map<int, QWidget *> pane_widgets_;
-  std::map<int, QPlainTextEdit *> output_editors_;
-  std::map<int, std::vector<std::string>> pane_topics_;
   std::map<int, QSplitter *> splitter_widgets_;
+  std::map<std::string, TopicDisplayWidgets> topic_display_widgets_;
+  std::map<std::string, std::deque<TopicUpdate>> topic_histories_;
+  std::map<std::string, size_t> topic_history_bytes_;
+  std::map<std::string, std::string> selected_graph_fields_;
+  std::map<std::string, std::pair<int, bool>> topic_scroll_states_;
   std::map<std::string, std::string> topic_types_;
+  QPushButton * display_mode_button_{};
+  bool graph_mode_{false};
   QLabel * status_{};
   QTimer * timer_{};
   QTimer * layout_save_timer_{};
